@@ -21,6 +21,9 @@ module IO::Stream
 	# It is also a multiple of the minimum read size, so that we can read in chunks without exceeding the maximum.
 	MAXIMUM_READ_SIZE = ENV.fetch("IO_STREAM_MAXIMUM_READ_SIZE", MINIMUM_READ_SIZE * 64).to_i
 	
+	# A read that fills at least 1/HANDOVER_RATIO of the input buffer is handed over without a copy, so a chunk holds at most this many times its size. A smaller read is copied out into a string of exactly its size.
+	HANDOVER_RATIO = ENV.fetch("IO_STREAM_HANDOVER_RATIO", 4).to_i
+	
 	# A module providing readable stream functionality.
 	#
 	# You must implement the `sysread` method to read data from the underlying IO. You may implement `sysread_nonblock` to support non-blocking partial peeks.
@@ -60,6 +63,8 @@ module IO::Stream
 			@read_buffer = StringBuffer.new
 			# Used as destination buffer for underlying reads.
 			@input_buffer = StringBuffer.new
+			# The largest read into the input buffer, which its capacity has grown to fit:
+			@input_buffer_size = 0
 			
 			# Support legacy block_size parameter for backwards compatibility
 			@minimum_read_size = block_size || minimum_read_size
@@ -292,7 +297,8 @@ module IO::Stream
 				
 				read_size = [size, @maximum_read_size].min
 				
-				result = sysread_nonblock(read_size, @read_buffer)
+				@input_buffer_size = read_size if read_size > @input_buffer_size
+				result = sysread_nonblock(read_size, @input_buffer)
 				case result
 				when :wait_readable, :wait_writable
 					return nil
@@ -300,6 +306,8 @@ module IO::Stream
 					@finished = true
 					return nil
 				end
+				
+				take_input_buffer(result)
 			end
 			
 			return @read_buffer.byteslice(0, [size, @read_buffer.bytesize].min)
@@ -417,23 +425,42 @@ module IO::Stream
 			# This effectively ties the input and output stream together.
 			self.flush
 			
-			if @read_buffer.empty?
+			if @read_buffer.empty? and size > @minimum_read_size
+				# A read larger than the minimum is for a caller that asked for that much, so read straight into the read buffer, which is allocated once at the full size:
 				if sysread(size, @read_buffer)
 					# Console.info(self, name: "read") {@read_buffer.inspect}
+					
 					return true
 				end
 			else
+				# Read into the reused input buffer:
+				@input_buffer_size = size if size > @input_buffer_size
 				if chunk = sysread(size, @input_buffer)
-					@read_buffer << chunk
+					if @read_buffer.empty?
+						take_input_buffer(chunk)
+					else
+						@read_buffer << chunk
+					end
 					# Console.info(self, name: "read") {@read_buffer.inspect}
 					
 					return true
 				end
 			end
 			
-			# else for both cases above:
 			@finished = true
 			return false
+		end
+		
+		# Moves a chunk read into the input buffer to the empty read buffer. A chunk that mostly fills the input buffer is handed over as is, without a copy. A smaller one is copied out, so the read buffer is sized to the data rather than to the read.
+		def take_input_buffer(chunk)
+			if chunk.bytesize * HANDOVER_RATIO >= @input_buffer_size
+				@read_buffer = @input_buffer
+				@input_buffer = StringBuffer.new
+				@input_buffer_size = 0
+			else
+				# Appending to an empty string would round its capacity up to as much as twice the data:
+				@read_buffer.bytesplice(0, 0, chunk)
+			end
 		end
 		
 		# Consumes at most `size` bytes from the buffer.
